@@ -12,7 +12,7 @@ st.set_page_config(
     page_title="MPLAD-AI",
     page_icon="🔍",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="auto"
 )
 
 
@@ -57,7 +57,8 @@ st.markdown(
     }
 
     header {
-        visibility: hidden;
+        visibility: visible;
+        background: transparent;
     }
 
 
@@ -141,6 +142,122 @@ st.markdown(
         margin-top: 25px;
     }
 
+
+
+    /* =====================================================
+       MOBILE RESPONSIVE DESIGN
+       ===================================================== */
+
+    @media (max-width: 768px) {
+
+        .block-container {
+            padding: 1rem 0.8rem 2rem 0.8rem;
+            max-width: 100%;
+        }
+
+        h1 {
+            font-size: 2rem !important;
+            line-height: 1.15 !important;
+        }
+
+        h2 {
+            font-size: 1.45rem !important;
+            line-height: 1.2 !important;
+        }
+
+        h3 {
+            font-size: 1.2rem !important;
+            line-height: 1.25 !important;
+        }
+
+        p {
+            font-size: 0.95rem;
+        }
+
+        /* Stack Streamlit columns vertically on phones */
+        [data-testid="stHorizontalBlock"] {
+            flex-wrap: wrap !important;
+            gap: 0.75rem !important;
+        }
+
+        [data-testid="stHorizontalBlock"] > div {
+            flex: 1 1 100% !important;
+            width: 100% !important;
+            min-width: 100% !important;
+        }
+
+        /* Metric cards */
+        [data-testid="stMetric"] {
+            padding: 14px;
+            border-radius: 12px;
+        }
+
+        [data-testid="stMetricLabel"] {
+            font-size: 0.85rem !important;
+        }
+
+        [data-testid="stMetricValue"] {
+            font-size: 1.65rem !important;
+            line-height: 1.15 !important;
+        }
+
+        /* Forms */
+        [data-testid="stForm"] {
+            padding: 14px;
+            border-radius: 12px;
+        }
+
+        /* Buttons */
+        .stButton > button,
+        [data-testid="stFormSubmitButton"] button {
+            min-height: 44px;
+            width: 100%;
+        }
+
+        /* Dataframe */
+        [data-testid="stDataFrame"] {
+            width: 100% !important;
+        }
+
+        /* Progress bars */
+        [data-testid="stProgress"] {
+            width: 100% !important;
+        }
+
+        /* Sidebar */
+        [data-testid="stSidebar"] {
+            min-width: 260px;
+            max-width: 85vw;
+        }
+
+        /* Prevent long text from overflowing */
+        [data-testid="stMarkdownContainer"],
+        [data-testid="stCaptionContainer"] {
+            overflow-wrap: anywhere;
+            word-break: normal;
+        }
+    }
+
+    /* Extra-small phones */
+    @media (max-width: 480px) {
+
+        .block-container {
+            padding-left: 0.6rem;
+            padding-right: 0.6rem;
+        }
+
+        [data-testid="stMetricValue"] {
+            font-size: 1.45rem !important;
+        }
+
+        [data-testid="stMetric"] {
+            padding: 12px;
+        }
+
+        [data-testid="stSidebar"] {
+            min-width: 240px;
+        }
+    }
 
     </style>
     """,
