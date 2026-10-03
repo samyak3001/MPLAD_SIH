@@ -3,9 +3,14 @@ import pandas as pd
 import numpy as np
 import joblib
 import sqlite3
+import os
 import json
 import re
-from datetime import datetime
+import hashlib
+import secrets
+import smtplib
+from email.message import EmailMessage
+from datetime import datetime, timedelta
 
 
 # =========================================================
@@ -47,7 +52,9 @@ state_delay_medians = joblib.load(
 # VERIFICATION DATABASE
 # =========================================================
 
-DB_PATH = "mplad_verification.db"
+# Always store/read the SQLite database beside app.py
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "mplad_verification.db")
 
 
 def get_db_connection():
@@ -68,6 +75,320 @@ def initialize_verification_db():
             submitted_at TEXT NOT NULL
         )
         """
+    )
+
+    # Officer accounts are stored securely in the same local SQLite database.
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS officer_users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            officer_name TEXT NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            phone TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            salt TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            approval_status TEXT NOT NULL DEFAULT 'Pending',
+            approved_at TEXT,
+            approved_by TEXT
+        )
+        """
+    )
+
+    existing_columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(officer_users)").fetchall()
+    }
+
+    if "approval_status" not in existing_columns:
+        connection.execute(
+            "ALTER TABLE officer_users ADD COLUMN approval_status TEXT NOT NULL DEFAULT 'Pending'"
+        )
+    if "approved_at" not in existing_columns:
+        connection.execute("ALTER TABLE officer_users ADD COLUMN approved_at TEXT")
+    if "approved_by" not in existing_columns:
+        connection.execute("ALTER TABLE officer_users ADD COLUMN approved_by TEXT")
+
+    connection.commit()
+    connection.close()
+
+
+def hash_password(password, salt=None):
+    """Create a salted PBKDF2 password hash using Python's standard library."""
+    if salt is None:
+        salt = secrets.token_hex(16)
+
+    password_hash = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt.encode("utf-8"),
+        200_000
+    ).hex()
+
+    return password_hash, salt
+
+
+def verify_password(password, stored_hash, salt):
+    """Check a password against the stored PBKDF2 hash."""
+    password_hash, _ = hash_password(password, salt)
+    return secrets.compare_digest(password_hash, stored_hash)
+
+
+def normalize_login_value(value):
+    """Normalize email or phone input before authentication."""
+    return str(value).strip().lower()
+
+
+def authenticate_officer(login_value, password):
+    """Authenticate an officer using either email or phone number."""
+    login_value = normalize_login_value(login_value)
+
+    connection = get_db_connection()
+
+    officer = connection.execute(
+        """
+        SELECT id, officer_name, email, phone, password_hash, salt, approval_status
+        FROM officer_users
+        WHERE lower(email) = ? OR phone = ?
+        """,
+        (login_value, login_value)
+    ).fetchone()
+
+    connection.close()
+
+    if officer is None:
+        return None
+
+    if not verify_password(password, officer[4], officer[5]):
+        return None
+
+    if officer[6] != "Approved":
+        return {
+            "id": officer[0],
+            "name": officer[1],
+            "email": officer[2],
+            "phone": officer[3],
+            "approval_status": officer[6],
+            "not_approved": True,
+        }
+
+    return {
+        "id": officer[0],
+        "name": officer[1],
+        "email": officer[2],
+        "phone": officer[3],
+        "approval_status": officer[6],
+        "not_approved": False,
+    }
+
+
+def find_officer(login_value):
+    """Find an officer account by email or phone."""
+    login_value = normalize_login_value(login_value)
+
+    connection = get_db_connection()
+
+    officer = connection.execute(
+        """
+        SELECT id, officer_name, email, phone
+        FROM officer_users
+        WHERE lower(email) = ? OR phone = ?
+        """,
+        (login_value, login_value)
+    ).fetchone()
+
+    connection.close()
+    return officer
+
+
+def update_officer_password(login_value, new_password):
+    """Replace an officer password with a newly generated salted hash."""
+    password_hash, salt = hash_password(new_password)
+
+    connection = get_db_connection()
+
+    connection.execute(
+        """
+        UPDATE officer_users
+        SET password_hash = ?, salt = ?
+        WHERE lower(email) = ? OR phone = ?
+        """,
+        (password_hash, salt, normalize_login_value(login_value), normalize_login_value(login_value))
+    )
+
+    connection.commit()
+    connection.close()
+
+
+def send_password_reset_otp(email_address):
+    """Generate and email a short-lived password-reset OTP."""
+    smtp_host = os.getenv("MPLAD_SMTP_HOST", "").strip()
+    smtp_port = int(os.getenv("MPLAD_SMTP_PORT", "587"))
+    smtp_user = os.getenv("MPLAD_SMTP_USER", "").strip()
+    smtp_password = os.getenv("MPLAD_SMTP_PASSWORD", "")
+    from_email = os.getenv("MPLAD_SMTP_FROM", smtp_user).strip()
+    use_tls = os.getenv("MPLAD_SMTP_TLS", "true").strip().lower() != "false"
+
+    if not all([smtp_host, smtp_user, smtp_password, from_email]):
+        return False, "Email OTP is not configured. Add the MPLAD SMTP environment variables first."
+
+    otp = f"{secrets.randbelow(1_000_000):06d}"
+    expires_at = datetime.now() + timedelta(minutes=5)
+
+    message = EmailMessage()
+    message["Subject"] = "MPLAD-AI Password Reset OTP"
+    message["From"] = from_email
+    message["To"] = email_address
+    message.set_content(
+        f"Your MPLAD-AI password reset OTP is {otp}.\n\n"
+        "This OTP is valid for 5 minutes. If you did not request a password reset, ignore this email."
+    )
+
+    try:
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as server:
+            if use_tls:
+                server.starttls()
+            server.login(smtp_user, smtp_password)
+            server.send_message(message)
+    except Exception as exc:
+        return False, f"Unable to send the OTP email: {exc}"
+
+    st.session_state["password_reset_otp"] = otp
+    st.session_state["password_reset_expires"] = expires_at
+    return True, None
+
+
+def is_valid_password_reset_otp(otp):
+    """Validate the emailed OTP and its five-minute expiry."""
+    stored_otp = st.session_state.get("password_reset_otp")
+    expires_at = st.session_state.get("password_reset_expires")
+
+    if not stored_otp or not expires_at:
+        return False
+
+    if datetime.now() > expires_at:
+        return False
+
+    return secrets.compare_digest(str(otp).strip(), stored_otp)
+
+
+def clear_password_reset_state():
+    """Clear all temporary password-recovery values."""
+    for key in [
+        "password_reset_login",
+        "password_reset_email",
+        "password_reset_otp",
+        "password_reset_expires",
+        "password_reset_step",
+    ]:
+        st.session_state.pop(key, None)
+
+
+def create_officer_account(officer_name, email, phone, password):
+    """Create a new officer account with a salted password hash."""
+    email = normalize_login_value(email)
+    phone = re.sub(r"\\D", "", str(phone).strip())
+
+    if not officer_name.strip():
+        return False, "Officer name is required."
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        return False, "Enter a valid email address."
+    if not re.fullmatch(r"\d{10}", phone):
+        return False, "Enter a valid 10-digit mobile number."
+    if len(password) < 8:
+        return False, "Password must contain at least 8 characters."
+
+    password_hash, salt = hash_password(password)
+
+    connection = get_db_connection()
+    try:
+        connection.execute(
+            """
+            INSERT INTO officer_users
+            (officer_name, email, phone, password_hash, salt, created_at, approval_status)
+            VALUES (?, ?, ?, ?, ?, ?, 'Pending')
+            """,
+            (
+                officer_name.strip(),
+                email,
+                phone,
+                password_hash,
+                salt,
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            ),
+        )
+        connection.commit()
+    except sqlite3.IntegrityError:
+        return False, "An officer account with this email or phone already exists."
+    finally:
+        connection.close()
+
+    return True, None
+
+
+def get_admin_credentials():
+    """Read administrator credentials from Streamlit secrets or environment variables."""
+    try:
+        admin_email = str(st.secrets.get("MPLAD_ADMIN_EMAIL", "")).strip().lower()
+        admin_password = str(st.secrets.get("MPLAD_ADMIN_PASSWORD", ""))
+    except Exception:
+        admin_email = ""
+        admin_password = ""
+
+    admin_email = os.getenv("MPLAD_ADMIN_EMAIL", admin_email).strip().lower()
+    admin_password = os.getenv("MPLAD_ADMIN_PASSWORD", admin_password)
+    return admin_email, admin_password
+
+
+def authenticate_admin(email, password):
+    """Authenticate administrator credentials stored outside the application database."""
+    admin_email, admin_password = get_admin_credentials()
+    return bool(
+        admin_email
+        and admin_password
+        and secrets.compare_digest(str(email).strip().lower(), admin_email)
+        and secrets.compare_digest(str(password), admin_password)
+    )
+
+
+def get_pending_officers():
+    connection = get_db_connection()
+    rows = connection.execute(
+        """
+        SELECT id, officer_name, email, phone, created_at, approval_status
+        FROM officer_users
+        WHERE approval_status = 'Pending'
+        ORDER BY id DESC
+        """
+    ).fetchall()
+    connection.close()
+    return rows
+
+
+def get_all_officers():
+    connection = get_db_connection()
+    rows = connection.execute(
+        """
+        SELECT id, officer_name, email, phone, created_at,
+               approval_status, approved_at, approved_by
+        FROM officer_users
+        ORDER BY id DESC
+        """
+    ).fetchall()
+    connection.close()
+    return rows
+
+
+def update_officer_approval(officer_id, status, admin_email):
+    connection = get_db_connection()
+    decision_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    connection.execute(
+        """
+        UPDATE officer_users
+        SET approval_status = ?, approved_at = ?, approved_by = ?
+        WHERE id = ?
+        """,
+        (status, decision_time, admin_email, int(officer_id)),
     )
 
     connection.commit()
@@ -129,6 +450,178 @@ def get_verification_history(work_id=None):
 
 
 initialize_verification_db()
+
+
+# =========================================================
+# AI-GUIDED VERIFICATION CHECKLIST
+# =========================================================
+
+def get_verification_checklist(row):
+    """
+    Generate a focused verification checklist for the selected work.
+
+    The checklist is based on:
+    1. Detected cost-related risk
+    2. Detected delay-related risk
+    3. Current work stage
+
+    The AI recommends what the officer should check. It does not
+    automatically verify any item.
+    """
+
+    checklist = []
+
+    # -----------------------------------------------------
+    # Always verify the identity/scope of the work.
+    # -----------------------------------------------------
+    checklist.append(
+        "Work description matches the official sanctioned record"
+    )
+
+    # -----------------------------------------------------
+    # COST-FOCUSED CHECKS
+    # Only add these when the AI sees a meaningful cost deviation.
+    # -----------------------------------------------------
+    cost_risk = (
+        row["COST_DEVIATION"] >= 5
+        or row["STATE_COST_DEVIATION"] >= 3
+    )
+
+    if cost_risk:
+        checklist.extend([
+            "Sanction amount matches the official sanction record",
+            "Work scope is consistent with the sanctioned amount",
+            "Supporting cost/sanction documents are checked, where available"
+        ])
+    else:
+        # For normal-cost works, one basic financial check is enough.
+        checklist.append(
+            "Sanction amount matches the official sanction record"
+        )
+
+    # -----------------------------------------------------
+    # DELAY-FOCUSED CHECKS
+    # Only add these when the AI sees a meaningful delay pattern.
+    # -----------------------------------------------------
+    delay_risk = (
+        row["SANCTION_DELAY_DAYS"] >= 300
+        or row["STATE_DELAY_DEVIATION"] >= 1.5
+    )
+
+    if delay_risk:
+        checklist.extend([
+            "Recommendation date and sanction date are verified",
+            "Sanction delay is verified against the official record",
+            "Reason or justification for the unusual delay is checked"
+        ])
+
+    # -----------------------------------------------------
+    # WORK-STAGE CHECKS
+    # Only the checks relevant to the current stage are added.
+    # -----------------------------------------------------
+    stage = str(row["WORK_STAGE"]).strip().lower()
+
+    if "physical inspection" in stage:
+        checklist.extend([
+            "Physical work/progress is checked against available evidence",
+            "Photographs or inspection evidence are checked, where available"
+        ])
+
+    elif "vendor identification" in stage:
+        checklist.extend([
+            "Implementing Agency/vendor information is checked",
+            "Relevant vendor/agency supporting documents are checked, where available"
+        ])
+
+    elif "partially completed" in stage:
+        checklist.extend([
+            "Current work progress is checked against the official record",
+            "Payment/expenditure information is checked, where applicable",
+            "Available progress photographs/evidence are checked"
+        ])
+
+    elif "completed" in stage:
+        checklist.extend([
+            "Completion status is verified",
+            "Completion evidence/photographs are checked, where available",
+            "Final payment/expenditure information is checked, where applicable"
+        ])
+
+    elif "sanction" in stage:
+        checklist.append(
+            "Sanction details are verified against the official record"
+        )
+
+    elif "time estimation" in stage:
+        checklist.append(
+            "Estimated timeline is checked against the work requirements"
+        )
+
+    # Remove duplicate checks while preserving their order.
+    return list(dict.fromkeys(checklist))
+
+
+def get_verification_source(check_item):
+    """Return the official source the officer should use for a checklist item."""
+
+    if "Work description" in check_item:
+        return "Official eSAKSHI work/sanction record"
+
+    if "Sanction amount" in check_item:
+        return "eSAKSHI sanction details / official sanction order"
+
+    if "Work scope" in check_item:
+        return "Official sanction order and sanctioned work details"
+
+    if "cost/sanction documents" in check_item:
+        return "eSAKSHI uploaded documents / official sanction records"
+
+    if "Recommendation date" in check_item:
+        return "eSAKSHI recommendation and sanction records"
+
+    if "Sanction delay" in check_item:
+        return "Recommendation and sanction dates in eSAKSHI"
+
+    if "justification" in check_item:
+        return "Official sanction record and supporting justification/documents"
+
+    if "Physical work/progress" in check_item:
+        return "eSAKSHI work-stage/progress record and inspection evidence"
+
+    if "Photographs" in check_item or "photographs" in check_item:
+        return "Photographs / inspection evidence available in the official record"
+
+    if "Implementing Agency/vendor" in check_item:
+        return "eSAKSHI Implementing Agency/vendor information"
+
+    if "vendor/agency" in check_item:
+        return "eSAKSHI uploaded vendor/agency supporting documents"
+
+    if "Current work progress" in check_item:
+        return "eSAKSHI current work-stage/progress record"
+
+    if "Payment/expenditure" in check_item or "payment/expenditure" in check_item:
+        return "eSAKSHI payment/expenditure information"
+
+    if "Completion status" in check_item:
+        return "eSAKSHI completion/work-stage record"
+
+    if "Completion evidence" in check_item:
+        return "eSAKSHI completion evidence / photographs"
+
+    if "Final payment" in check_item:
+        return "eSAKSHI final payment/expenditure information"
+
+    if "Sanction details" in check_item:
+        return "eSAKSHI sanction record / sanction order"
+
+    if "Estimated timeline" in check_item:
+        return "Official work record and sanction/timeline documents"
+
+    if "Available progress" in check_item:
+        return "eSAKSHI progress photographs/evidence"
+
+    return "Official eSAKSHI record or supporting document"
 
 
 # =========================================================
@@ -804,6 +1297,60 @@ st.markdown(
     }
 
     /* =====================================================
+       FAST MODERN VERIFICATION SEARCH
+       ===================================================== */
+
+    .verification-search-label {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin: 14px 0 8px 2px;
+        color: #334155;
+        font-size: 0.82rem;
+        font-weight: 800;
+        letter-spacing: 0.02em;
+        text-transform: uppercase;
+    }
+
+    .search-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #2563eb;
+        box-shadow: 0 0 0 5px rgba(37,99,235,0.10), 0 0 14px rgba(37,99,235,0.28);
+    }
+
+    .verification-search-label + div [data-testid="stForm"] {
+        padding: 7px !important;
+        border-radius: 17px !important;
+        background: rgba(255,255,255,0.72) !important;
+        box-shadow: 0 8px 24px rgba(15,23,42,0.07) !important;
+    }
+
+    [data-testid="stTextInput"] input {
+        min-height: 48px !important;
+        padding: 0 16px !important;
+        border: 1px solid rgba(148,163,184,0.28) !important;
+        border-radius: 13px !important;
+        background: rgba(248,250,252,0.96) !important;
+        color: #0f172a !important;
+        font-size: 0.98rem !important;
+        font-weight: 700 !important;
+    }
+
+    [data-testid="stTextInput"] input:focus {
+        border-color: rgba(37,99,235,0.58) !important;
+        background: #ffffff !important;
+        box-shadow: 0 0 0 4px rgba(37,99,235,0.09), 0 8px 22px rgba(37,99,235,0.08) !important;
+    }
+
+    [data-testid="stFormSubmitButton"] button {
+        min-height: 48px !important;
+        border-radius: 13px !important;
+        font-weight: 800 !important;
+    }
+
+    /* =====================================================
        MOBILE RESPONSIVE DESIGN
        ===================================================== */
 
@@ -1177,9 +1724,691 @@ st.markdown(
 )
 
 
+
+# =========================================================
+# OFFICER AUTHENTICATION
+# =========================================================
+
+# The app uses a real SQLite-backed officer account and login session.
+# No demo account or hard-coded credentials are created.
+if "authenticated" not in st.session_state:
+    st.session_state["authenticated"] = False
+
+if "admin_authenticated" not in st.session_state:
+    st.session_state["admin_authenticated"] = False
+
+if "admin_email" not in st.session_state:
+    st.session_state["admin_email"] = ""
+
+if "officer_name" not in st.session_state:
+    st.session_state["officer_name"] = ""
+
+if "officer_email" not in st.session_state:
+    st.session_state["officer_email"] = ""
+
+if "password_reset_step" not in st.session_state:
+    st.session_state["password_reset_step"] = "request"
+
+if "login_mode" not in st.session_state:
+    st.session_state["login_mode"] = "login"
+
+# Direct administrator portal URL:
+# https://your-app.streamlit.app/?portal=admin
+# This keeps the officer portal at the normal URL and opens the
+# administrator approval portal only when the admin URL is used.
+try:
+    requested_portal = str(st.query_params.get("portal", "")).strip().lower()
+except Exception:
+    requested_portal = ""
+
+if requested_portal == "admin" and not st.session_state.get("authenticated", False):
+    st.session_state["login_mode"] = "admin"
+
+
+st.markdown(
+    """
+    <style>
+    /* =====================================================
+       PROFESSIONAL OFFICER AUTHENTICATION UI
+       ===================================================== */
+
+    .mplad-auth-page {
+        min-height: 78vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 28px 0 50px 0;
+    }
+
+    .mplad-auth-brand {
+        text-align: center;
+        margin-bottom: 22px;
+    }
+
+    .mplad-auth-logo {
+        width: 58px;
+        height: 58px;
+        margin: 0 auto 14px auto;
+        display: grid;
+        place-items: center;
+        border-radius: 17px;
+        background: linear-gradient(145deg, #2563eb, #4f46e5);
+        color: #ffffff;
+        font-size: 25px;
+        font-weight: 900;
+        box-shadow: 0 12px 28px rgba(37,99,235,.28), inset 0 1px 1px rgba(255,255,255,.42);
+    }
+
+    .mplad-auth-title {
+        color: #0f172a;
+        font-size: 1.85rem;
+        font-weight: 900;
+        letter-spacing: -0.04em;
+        line-height: 1.1;
+    }
+
+    .mplad-auth-subtitle {
+        margin: 7px auto 0 auto;
+        max-width: 430px;
+        color: #64748b;
+        font-size: .88rem;
+        line-height: 1.5;
+    }
+
+    .mplad-auth-security {
+        display: flex;
+        justify-content: center;
+        gap: 8px;
+        flex-wrap: wrap;
+        margin-top: 13px;
+    }
+
+    .mplad-auth-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        padding: 5px 9px;
+        border-radius: 999px;
+        background: rgba(239,246,255,.85);
+        border: 1px solid rgba(37,99,235,.12);
+        color: #475569;
+        font-size: .70rem;
+        font-weight: 700;
+    }
+
+    [data-testid="stForm"]:has(.mplad-login-form-marker) {
+        padding: 25px 25px 21px 25px !important;
+        border: 1px solid rgba(148,163,184,.20) !important;
+        border-radius: 22px !important;
+        background: rgba(255,255,255,.92) !important;
+        box-shadow: 0 24px 60px rgba(15,23,42,.11), inset 0 1px 0 rgba(255,255,255,.95) !important;
+        backdrop-filter: blur(18px);
+        -webkit-backdrop-filter: blur(18px);
+    }
+
+    .mplad-login-form-marker {
+        height: 0;
+        overflow: hidden;
+        margin: 0;
+    }
+
+    .mplad-login-form-title {
+        color: #0f172a;
+        font-size: 1rem;
+        font-weight: 850;
+        margin-bottom: 2px;
+    }
+
+    .mplad-login-form-caption {
+        color: #94a3b8;
+        font-size: .76rem;
+        margin-bottom: 13px;
+    }
+
+    .mplad-demo-access {
+        margin-top: 12px;
+        padding: 11px 13px;
+        border-radius: 13px;
+        border: 1px solid rgba(148,163,184,.18);
+        background: rgba(248,250,252,.78);
+        color: #64748b;
+        font-size: .72rem;
+        line-height: 1.6;
+    }
+
+    .mplad-demo-access strong {
+        color: #334155;
+    }
+
+    .mplad-login-footer {
+        margin-top: 15px;
+        text-align: center;
+        color: #94a3b8;
+        font-size: .68rem;
+        line-height: 1.5;
+    }
+
+    .mplad-auth-status {
+        margin: 0 auto 14px auto;
+        max-width: 560px;
+        padding: 10px 14px;
+        border-radius: 12px;
+        background: rgba(239,246,255,.80);
+        border: 1px solid rgba(37,99,235,.13);
+        color: #475569;
+        text-align: center;
+        font-size: .80rem;
+    }
+
+    @media (max-width: 768px) {
+        .mplad-auth-page {
+            min-height: auto;
+            padding: 12px 0 30px 0;
+        }
+        .mplad-login-form {
+            padding: 20px 17px 17px 17px;
+            border-radius: 18px;
+        }
+        .mplad-auth-title {
+            font-size: 1.65rem;
+        }
+    }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
+
+def show_login_page():
+    """Render the officer sign-in screen."""
+
+    st.markdown('<div class="mplad-auth-page">', unsafe_allow_html=True)
+
+    left, center, right = st.columns([1.05, 1.35, 1.05])
+
+    with center:
+        st.markdown(
+            """
+            <div class="mplad-auth-brand">
+                <div class="mplad-auth-logo">⌁</div>
+                <div class="mplad-auth-title">MPLAD-AI</div>
+                <div class="mplad-auth-subtitle">
+                    Officer access to the MPLAD Risk Intelligence Platform
+                </div>
+                <div class="mplad-auth-security">
+                    <span class="mplad-auth-chip">🔒 Secure access</span>
+                    <span class="mplad-auth-chip">✦ AI-assisted review</span>
+                </div>
+            </div>
+            <div class="mplad-login-form-title">Officer Sign In</div>
+            <div class="mplad-login-form-caption">
+                Sign in with your registered email address or mobile number.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        with st.form("officer_login_form", clear_on_submit=False):
+            login_value = st.text_input(
+                "Email or Phone Number",
+                placeholder="Enter registered email or 10-digit mobile number",
+                key="login_value",
+            )
+
+            password = st.text_input(
+                "Password",
+                type="password",
+                placeholder="Enter your password",
+                key="login_password",
+            )
+
+            login_clicked = st.form_submit_button(
+                "🔐  Sign In",
+                use_container_width=True,
+            )
+
+        if login_clicked:
+            if not login_value.strip() or not password:
+                st.warning("Please enter your email/phone number and password.")
+            else:
+                officer = authenticate_officer(login_value, password)
+
+                if officer is None:
+                    st.error("Invalid email/phone number or password.")
+                elif officer.get("not_approved"):
+                    if officer.get("approval_status") == "Pending":
+                        st.warning(
+                            "Your officer account is pending administrator approval. "
+                            "You can sign in after the administrator approves your registration."
+                        )
+                    else:
+                        st.error(
+                            "Your officer account was rejected. Please contact the administrator."
+                        )
+                else:
+                    st.session_state["authenticated"] = True
+                    st.session_state["officer_id"] = officer["id"]
+                    st.session_state["officer_name"] = officer["name"]
+                    st.session_state["officer_email"] = officer["email"]
+                    st.session_state["navigation_section"] = "Dashboard"
+                    st.rerun()
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            if st.button(
+                "Forgot password?",
+                use_container_width=True,
+                key="forgot_password_button",
+            ):
+                st.session_state["password_reset_step"] = "request"
+                st.session_state["login_mode"] = "forgot"
+                st.rerun()
+
+        with col2:
+            if st.button(
+                "Create officer account",
+                use_container_width=True,
+                key="create_account_button",
+            ):
+                st.session_state["login_mode"] = "register"
+                st.rerun()
+
+        st.markdown(
+            """
+            <div class="mplad-login-footer">
+                Authorized officer access only • Passwords are stored using salted secure hashes.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def show_register_page():
+    """Create a real officer account in the local SQLite database."""
+
+    st.markdown('<div class="mplad-auth-page">', unsafe_allow_html=True)
+
+    left, center, right = st.columns([1.05, 1.35, 1.05])
+
+    with center:
+        st.markdown(
+            """
+            <div class="mplad-auth-brand">
+                <div class="mplad-auth-logo">+</div>
+                <div class="mplad-auth-title">Officer Registration</div>
+                <div class="mplad-auth-subtitle">
+                    Create an authenticated MPLAD-AI officer account
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        with st.form("officer_registration_form", clear_on_submit=False):
+            officer_name = st.text_input(
+                "Officer Name",
+                placeholder="Enter full name",
+                key="register_name",
+            )
+            email = st.text_input(
+                "Email Address",
+                placeholder="Enter official email address",
+                key="register_email",
+            )
+            phone = st.text_input(
+                "Mobile Number",
+                placeholder="Enter 10-digit mobile number",
+                max_chars=10,
+                key="register_phone",
+            )
+            password = st.text_input(
+                "Password",
+                type="password",
+                placeholder="Minimum 8 characters",
+                key="register_password",
+            )
+            confirm_password = st.text_input(
+                "Confirm Password",
+                type="password",
+                placeholder="Re-enter password",
+                key="register_confirm_password",
+            )
+
+            create_clicked = st.form_submit_button(
+                "Create Account",
+                use_container_width=True,
+            )
+
+        if create_clicked:
+            if password != confirm_password:
+                st.error("Passwords do not match.")
+            else:
+                created, message = create_officer_account(
+                    officer_name,
+                    email,
+                    phone,
+                    password,
+                )
+
+                if created:
+                    st.success("Registration submitted successfully. Your account is waiting for administrator approval.")
+                    st.session_state["login_mode"] = "login"
+                    st.rerun()
+                else:
+                    st.error(message)
+
+        if st.button(
+            "← Back to Sign In",
+            use_container_width=True,
+            key="back_from_register",
+        ):
+            st.session_state["login_mode"] = "login"
+            st.rerun()
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def show_admin_page():
+    """Administrator dashboard for reviewing officer registrations."""
+    st.markdown('<div class="mplad-auth-page">', unsafe_allow_html=True)
+
+    left, center, right = st.columns([0.75, 2.1, 0.75])
+
+    with center:
+        st.markdown(
+            """
+            <div class="mplad-auth-brand">
+                <div class="mplad-auth-logo">✓</div>
+                <div class="mplad-auth-title">Administrator Portal</div>
+                <div class="mplad-auth-subtitle">
+                    Review and approve registered MPLAD-AI officer accounts
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        if not st.session_state.get("admin_authenticated"):
+            with st.form("admin_login_form", clear_on_submit=False):
+                email = st.text_input(
+                    "Administrator Email",
+                    placeholder="Enter administrator email",
+                )
+                password = st.text_input(
+                    "Administrator Password",
+                    type="password",
+                    placeholder="Enter administrator password",
+                )
+                submitted = st.form_submit_button(
+                    "Administrator Sign In",
+                    use_container_width=True,
+                )
+
+            if submitted:
+                if authenticate_admin(email, password):
+                    st.session_state["admin_authenticated"] = True
+                    st.session_state["admin_email"] = email.strip().lower()
+                    st.rerun()
+                else:
+                    st.error("Invalid administrator credentials.")
+
+            st.info(
+                "Administrator credentials are configured through deployment secrets "
+                "and are not stored in the officer database."
+            )
+        else:
+            pending = get_pending_officers()
+            all_officers = get_all_officers()
+
+            approved_count = sum(1 for row in all_officers if row[5] == "Approved")
+            rejected_count = sum(1 for row in all_officers if row[5] == "Rejected")
+
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Pending", len(pending))
+            m2.metric("Approved", approved_count)
+            m3.metric("Rejected", rejected_count)
+
+            st.markdown("### Pending Officer Registrations")
+
+            if not pending:
+                st.success("There are no officer registrations waiting for approval.")
+            else:
+                for row in pending:
+                    officer_id, name, email, phone, created_at, status = row
+
+                    with st.container(border=True):
+                        c1, c2 = st.columns([3, 1.2])
+
+                        with c1:
+                            st.markdown(f"**{name}**")
+                            st.caption(
+                                f"{email}  •  {phone}  •  Registered: {created_at}"
+                            )
+
+                        with c2:
+                            approve_col, reject_col = st.columns(2)
+
+                            with approve_col:
+                                if st.button(
+                                    "Approve",
+                                    key=f"approve_officer_{officer_id}",
+                                    use_container_width=True,
+                                ):
+                                    update_officer_approval(
+                                        officer_id,
+                                        "Approved",
+                                        st.session_state["admin_email"],
+                                    )
+                                    st.rerun()
+
+                            with reject_col:
+                                if st.button(
+                                    "Reject",
+                                    key=f"reject_officer_{officer_id}",
+                                    use_container_width=True,
+                                ):
+                                    update_officer_approval(
+                                        officer_id,
+                                        "Rejected",
+                                        st.session_state["admin_email"],
+                                    )
+                                    st.rerun()
+
+            st.markdown("### Officer Accounts")
+
+            if all_officers:
+                df = pd.DataFrame(
+                    all_officers,
+                    columns=[
+                        "ID", "Officer Name", "Email", "Phone", "Registered",
+                        "Status", "Decision Time", "Approved By"
+                    ],
+                )
+                st.dataframe(
+                    df[
+                        ["ID", "Officer Name", "Email", "Phone", "Registered", "Status"]
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+            if st.button(
+                "Logout Administrator",
+                use_container_width=True,
+                key="admin_logout",
+            ):
+                st.session_state["admin_authenticated"] = False
+                st.session_state["admin_email"] = ""
+                st.session_state["login_mode"] = "login"
+                st.query_params.clear()
+                st.rerun()
+
+        if st.button(
+            "← Back to Officer Sign In",
+            use_container_width=True,
+            key="back_from_admin",
+        ):
+            st.session_state["login_mode"] = "login"
+            st.session_state["admin_authenticated"] = False
+            st.session_state["admin_email"] = ""
+            st.query_params.clear()
+            st.rerun()
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def show_password_reset_page():
+    """Render the real email-OTP password recovery flow."""
+
+    st.markdown('<div class="mplad-auth-page">', unsafe_allow_html=True)
+
+    left, center, right = st.columns([1.05, 1.35, 1.05])
+
+    with center:
+        st.markdown(
+            """
+            <div class="mplad-auth-brand">
+                <div class="mplad-auth-logo">↻</div>
+                <div class="mplad-auth-title">Reset Password</div>
+                <div class="mplad-auth-subtitle">
+                    Recover your officer account using an OTP sent to the registered email.
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        step = st.session_state.get("password_reset_step", "request")
+
+        if step == "request":
+            reset_login = st.text_input(
+                "Registered Email or Phone Number",
+                placeholder="Enter your registered email or phone",
+                key="reset_login",
+            )
+
+            if st.button(
+                "Send OTP",
+                use_container_width=True,
+                type="primary",
+                key="send_reset_otp",
+            ):
+                officer = find_officer(reset_login)
+
+                if officer is None:
+                    st.error("No officer account was found for that email/phone.")
+                else:
+                    # OTP recovery is delivered through the officer's registered email.
+                    success, message = send_password_reset_otp(officer[2])
+
+                    if success:
+                        st.session_state["password_reset_login"] = normalize_login_value(reset_login)
+                        st.session_state["password_reset_email"] = officer[2]
+                        st.session_state["password_reset_step"] = "otp"
+                        st.success(f"OTP sent to {officer[2]}.")
+                        st.rerun()
+                    else:
+                        st.error(message)
+
+            st.caption(
+                "The OTP is sent to the registered email address. "
+                "No OTP is displayed in the application."
+            )
+
+        elif step == "otp":
+            st.info(
+                f"Enter the 6-digit OTP sent to {st.session_state.get('password_reset_email', '')}."
+            )
+
+            otp = st.text_input(
+                "Enter OTP",
+                max_chars=6,
+                placeholder="6-digit OTP",
+                key="reset_otp",
+            )
+
+            if st.button(
+                "Verify OTP",
+                use_container_width=True,
+                type="primary",
+                key="verify_reset_otp",
+            ):
+                if is_valid_password_reset_otp(otp):
+                    st.session_state["password_reset_step"] = "new_password"
+                    st.rerun()
+                else:
+                    st.error("Invalid or expired OTP.")
+
+        elif step == "new_password":
+            new_password = st.text_input(
+                "New Password",
+                type="password",
+                placeholder="Minimum 8 characters",
+                key="new_reset_password",
+            )
+
+            confirm_password = st.text_input(
+                "Confirm New Password",
+                type="password",
+                placeholder="Re-enter password",
+                key="confirm_reset_password",
+            )
+
+            if st.button(
+                "Reset Password",
+                use_container_width=True,
+                type="primary",
+                key="reset_password_button",
+            ):
+                if len(new_password) < 8:
+                    st.error("Password must contain at least 8 characters.")
+                elif new_password != confirm_password:
+                    st.error("Passwords do not match.")
+                else:
+                    update_officer_password(
+                        st.session_state["password_reset_login"],
+                        new_password,
+                    )
+                    clear_password_reset_state()
+                    st.session_state["login_mode"] = "login"
+                    st.success("Password reset successfully. You can now sign in.")
+                    st.rerun()
+
+        if st.button(
+            "← Back to Sign In",
+            use_container_width=True,
+            key="back_to_login",
+        ):
+            clear_password_reset_state()
+            st.session_state["login_mode"] = "login"
+            st.rerun()
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+# ---------------------------------------------------------
+# Stop the protected application until an officer logs in.
+# ---------------------------------------------------------
+if not st.session_state["authenticated"]:
+    if st.session_state.get("login_mode") == "forgot":
+        show_password_reset_page()
+    elif st.session_state.get("login_mode") == "register":
+        show_register_page()
+    elif st.session_state.get("login_mode") == "admin":
+        show_admin_page()
+    else:
+        show_login_page()
+
+    st.stop()
+
+
 # =========================================================
 # SIDEBAR NAVIGATION
 # =========================================================
+
 
 st.sidebar.markdown(
     """
@@ -1225,6 +2454,34 @@ for page_name, button_label in navigation_options:
         on_click=set_navigation,
         args=(page_name,)
     )
+
+
+st.sidebar.markdown(
+    f"""
+    <div class="mplad-sidebar-section" style="margin-top:18px;">Officer</div>
+    <div class="mplad-sidebar-brand" style="margin-top:4px;">
+        <div class="mplad-sidebar-orb">✓</div>
+        <div>
+            <div class="mplad-sidebar-title">{st.session_state.get("officer_name", "Officer")}</div>
+            <div class="mplad-sidebar-subtitle">{st.session_state.get("officer_email", "")}</div>
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
+
+if st.sidebar.button(
+    "↪  Logout",
+    key="officer_logout",
+    use_container_width=True
+):
+    st.session_state["authenticated"] = False
+    st.session_state["officer_name"] = ""
+    st.session_state["officer_email"] = ""
+    st.session_state.pop("officer_id", None)
+    st.session_state["navigation_section"] = "Dashboard"
+    st.session_state["login_mode"] = "login"
+    st.rerun()
 
 
 section = st.session_state["navigation_section"]
@@ -2502,23 +3759,61 @@ elif section == "Priority Review":
 
 
         # -------------------------------------------------
-        # SELECT WORK
+        # SEARCH WORK
         # -------------------------------------------------
 
         st.markdown("## Work Details")
+        st.caption("Search a priority work directly by its Work ID.")
 
+        # Store the selected work in session state so the same work remains
+        # selected after Streamlit reruns caused by other interactions.
+        if "priority_selected_work_id" not in st.session_state:
+            st.session_state["priority_selected_work_id"] = int(priority_works.index[0])
 
-        selected_index = st.selectbox(
-            "Select a work to inspect",
-            priority_works.index.tolist(),
-            format_func=lambda x:
-            f"Work {x}"
-        )
+        with st.form("priority_work_search_form", clear_on_submit=False):
+            search_col1, search_col2 = st.columns([5.5, 1.15])
 
+            with search_col1:
+                priority_work_search = st.text_input(
+                    "Work ID",
+                    value=str(st.session_state["priority_selected_work_id"]),
+                    placeholder="Enter Work ID (e.g. 31636)",
+                    label_visibility="collapsed",
+                    key="priority_work_search_input"
+                )
 
-        selected_work = priority_works.loc[
-            selected_index
-        ]
+            with search_col2:
+                priority_search_button = st.form_submit_button(
+                    "🔎 Search",
+                    use_container_width=True
+                )
+
+        if priority_search_button:
+            search_value = priority_work_search.strip()
+
+            if not search_value:
+                st.warning("Please enter a Work ID.")
+            elif not search_value.isdigit():
+                st.warning("Please enter a valid numeric Work ID.")
+            else:
+                requested_work_id = int(search_value)
+
+                if requested_work_id in priority_works.index:
+                    st.session_state["priority_selected_work_id"] = requested_work_id
+                else:
+                    st.error(
+                        f"Work ID {requested_work_id} was not found in the current Priority Review list."
+                    )
+
+        selected_index = st.session_state["priority_selected_work_id"]
+
+        # Safety check in case filters change and the previously selected
+        # work is no longer present in the filtered Priority Review list.
+        if selected_index not in priority_works.index:
+            selected_index = int(priority_works.index[0])
+            st.session_state["priority_selected_work_id"] = selected_index
+
+        selected_work = priority_works.loc[selected_index]
 
 
         # -------------------------------------------------
@@ -2709,6 +4004,7 @@ elif section == "Priority Review":
         ):
 
             st.session_state["verification_work_id"] = int(selected_index)
+            st.session_state["verification_work_id_input"] = str(int(selected_index))
             st.session_state["navigation_section"] = "Verification"
             st.rerun()
 
@@ -2736,15 +4032,61 @@ elif section == "Verification":
         int(work.sort_values("BASE_RISK_SCORE", ascending=False).index[0])
     )
 
-    work_id_input = st.number_input(
-        "Work ID",
-        min_value=int(work.index.min()),
-        max_value=int(work.index.max()),
-        value=int(default_work_id),
-        step=1
+    # Fast Work ID search: typing does not rerun the whole app.
+    # The selected work loads only after the officer presses Search.
+    if "verification_work_id_input" not in st.session_state:
+        st.session_state["verification_work_id_input"] = str(int(default_work_id))
+
+    st.markdown(
+        """
+        <div class="verification-search-label">
+            <span class="search-dot"></span> Work ID Search
+        </div>
+        """,
+        unsafe_allow_html=True
     )
 
-    verification_work_id = int(work_id_input)
+    with st.form("verification_work_search", clear_on_submit=False):
+        search_col, button_col = st.columns([5.8, 1.2])
+
+        with search_col:
+            work_id_text = st.text_input(
+                "",
+                placeholder="Enter Work ID (e.g. 31636)",
+                label_visibility="collapsed",
+                key="verification_work_id_input"
+            )
+
+        with button_col:
+            search_work = st.form_submit_button(
+                "🔎 Search",
+                use_container_width=True
+            )
+
+    if search_work:
+        cleaned_work_id = work_id_text.strip()
+
+        if not cleaned_work_id.isdigit():
+            st.session_state["verification_search_error"] = (
+                "Please enter a valid numeric Work ID."
+            )
+        else:
+            searched_work_id = int(cleaned_work_id)
+            st.session_state["verification_work_id"] = searched_work_id
+            st.session_state["verification_search_error"] = ""
+            st.rerun()
+
+    search_error = st.session_state.get("verification_search_error", "")
+    if search_error:
+        st.warning(search_error)
+
+    verification_work_id = int(
+        st.session_state.get("verification_work_id", default_work_id)
+    )
+
+    # Each re-verification gets a fresh widget cycle so the officer
+    # starts with a new checklist and review fields.
+    verification_cycle = st.session_state.get("verification_cycle", 0)
 
     if verification_work_id not in work.index:
 
@@ -2813,36 +4155,102 @@ elif section == "Verification":
             st.info("No specific rule-based reason was identified.")
 
         # -------------------------------------------------
-        # VERIFICATION CHECKLIST
+        # AI-GUIDED VERIFICATION CHECKLIST
         # -------------------------------------------------
 
-        st.markdown("## Verification Checklist")
+        st.markdown("## AI-Guided Verification Checklist")
 
         st.caption(
-            "Check each item using the official work record and available supporting evidence."
+            "Only the checks relevant to this work's detected risk pattern "
+            "and current work stage are shown."
         )
 
-        checklist = [
-            "Work description matches the official record",
-            "Sanction amount matches the official record",
-            "Recommendation date is verified",
-            "Sanction date is verified",
-            "Sanction delay and its justification are checked",
-            "Supporting documents have been checked",
-            "Photographs or other available evidence have been checked",
-            "Current work stage and progress have been checked",
-            "Payment information has been checked where applicable"
+        checklist = get_verification_checklist(selected_work)
+
+        st.info(
+            f"{len(checklist)} focused verification checks generated for this work. "
+            "The officer does not need to verify unrelated items."
+        )
+
+        st.markdown(
+            "**Verification source:** Use the officer's authorized **official eSAKSHI records** "
+            "and available supporting documents/evidence to check each item below."
+        )
+
+        st.link_button(
+            "Open Official eSAKSHI Portal",
+            "https://mplads.mospi.gov.in/digigov/dashboard.html"
+        )
+
+        st.caption(
+            "MPLAD-AI does not directly verify or modify eSAKSHI records. "
+            "It identifies what the officer should check; the officer makes the final verification decision."
+        )
+
+        # -------------------------------------------------
+        # VERIFICATION RESULT FOR EACH CHECK
+        # -------------------------------------------------
+
+        st.markdown("### Verification Results")
+
+        st.caption(
+            "For each check, select what the officer found in the official "
+            "eSAKSHI record or supporting evidence. A missing document does "
+            "not need to be marked as verified."
+        )
+
+        verification_options = [
+            "Not Checked",
+            "Verified",
+            "Mismatch / Concern",
+            "Not Available / Missing"
         ]
 
-        checked = []
+        verification_results = {}
 
         for number, item in enumerate(checklist, start=1):
-            checked.append(
-                st.checkbox(
-                    item,
-                    key=f"verification_{verification_work_id}_{number}"
-                )
+
+            st.markdown(f"**{number}. {item}**")
+
+            result = st.selectbox(
+                "Result",
+                verification_options,
+                key=f"verification_result_{verification_work_id}_{verification_cycle}_{number}",
+                label_visibility="collapsed"
             )
+
+            verification_results[item] = result
+
+            st.caption(
+                f"Source: {get_verification_source(item)}"
+            )
+
+        verified_count = sum(
+            value == "Verified"
+            for value in verification_results.values()
+        )
+
+        concern_count = sum(
+            value == "Mismatch / Concern"
+            for value in verification_results.values()
+        )
+
+        missing_count = sum(
+            value == "Not Available / Missing"
+            for value in verification_results.values()
+        )
+
+        unchecked_count = sum(
+            value == "Not Checked"
+            for value in verification_results.values()
+        )
+
+        st.info(
+            f"Verification summary: {verified_count} verified · "
+            f"{concern_count} concern(s) · "
+            f"{missing_count} missing · "
+            f"{unchecked_count} not checked"
+        )
 
         # -------------------------------------------------
         # OFFICER DECISION
@@ -2859,14 +4267,14 @@ elif section == "Verification":
                 "Information / Document Missing",
                 "Concern Identified"
             ],
-            key=f"verification_status_{verification_work_id}"
+            key=f"verification_status_{verification_work_id}_{verification_cycle}"
         )
 
         officer_remarks = st.text_area(
             "Officer Remarks",
             placeholder="Enter verification observations or supporting remarks...",
             height=120,
-            key=f"verification_remarks_{verification_work_id}"
+            key=f"verification_remarks_{verification_work_id}_{verification_cycle}"
         )
 
         if st.button(
@@ -2882,24 +4290,59 @@ elif section == "Verification":
                     "Please select a final verification status before submitting."
                 )
 
-            elif not all(checked):
+            elif unchecked_count > 0:
 
                 st.warning(
-                    "Please complete all verification checklist items before submitting."
+                    "Please select a result for every verification check before submitting."
+                )
+
+            elif (
+                verification_status == "Verified - No Issue Found"
+                and concern_count > 0
+            ):
+
+                st.warning(
+                    "The status 'Verified - No Issue Found' cannot be submitted "
+                    "while one or more checks show a mismatch or concern."
+                )
+
+            elif (
+                verification_status == "Verified - No Issue Found"
+                and missing_count > 0
+            ):
+
+                st.warning(
+                    "The status 'Verified - No Issue Found' requires all verification "
+                    "checks to be confirmed from available official records."
+                )
+
+            elif (
+                verification_status == "Concern Identified"
+                and concern_count == 0
+            ):
+
+                st.warning(
+                    "For 'Concern Identified', at least one verification check "
+                    "should be marked 'Mismatch / Concern'."
+                )
+
+            elif (
+                verification_status == "Information / Document Missing"
+                and missing_count == 0
+            ):
+
+                st.warning(
+                    "For 'Information / Document Missing', at least one verification "
+                    "check should be marked 'Not Available / Missing'."
                 )
 
             else:
-
-                checklist_data = {
-                    item: bool(value)
-                    for item, value in zip(checklist, checked)
-                }
 
                 save_verification(
                     verification_work_id,
                     verification_status,
                     officer_remarks,
-                    checklist_data
+                    verification_results
                 )
 
                 st.success(
@@ -2920,28 +4363,244 @@ elif section == "Verification":
         # VERIFICATION HISTORY
         # -------------------------------------------------
 
-        history = get_verification_history(verification_work_id)
+        history = get_verification_history()
 
         if not history.empty:
 
             st.markdown("## Verification History")
 
-            history_display = history[
-                ["id", "status", "remarks", "submitted_at"]
-            ].copy()
-
-            history_display.columns = [
-                "Record ID",
-                "Status",
-                "Officer Remarks",
-                "Submitted At"
-            ]
-
-            st.dataframe(
-                history_display,
-                use_container_width=True,
-                hide_index=True
+            st.caption(
+                "Each record shows a quick verification summary. "
+                "Use View Details to inspect the complete checklist, sources and officer remarks."
             )
+
+            reverify_statuses = {
+                "Requires Further Review",
+                "Information / Document Missing",
+                "Concern Identified"
+            }
+
+            st.markdown(
+                """
+                <style>
+                .verification-history-status {
+                    display: inline-flex;
+                    align-items: center;
+                    padding: 5px 10px;
+                    border-radius: 999px;
+                    font-size: 0.82rem;
+                    font-weight: 700;
+                    line-height: 1.2;
+                    border: 1px solid transparent;
+                }
+                .verification-status-red {
+                    color: #b91c1c;
+                    background: #fee2e2;
+                    border-color: #fecaca;
+                }
+                .verification-status-green {
+                    color: #166534;
+                    background: #dcfce7;
+                    border-color: #bbf7d0;
+                }
+                .verification-status-orange {
+                    color: #9a3412;
+                    background: #ffedd5;
+                    border-color: #fed7aa;
+                }
+                .verification-summary-line {
+                    color: #475569;
+                    font-size: 0.86rem;
+                    font-weight: 650;
+                    margin-top: 4px;
+                }
+                </style>
+                """,
+                unsafe_allow_html=True
+            )
+
+            # Header
+            h1, h2, h3, h4, h5, h6 = st.columns(
+                [0.6, 0.7, 1.8, 2.2, 1.7, 1.8]
+            )
+            h1.markdown("**Record**")
+            h2.markdown("**Work ID**")
+            h3.markdown("**Status**")
+            h4.markdown("**Verification Summary**")
+            h5.markdown("**Submitted At**")
+            h6.markdown("**Action**")
+
+            for _, record in history.iterrows():
+
+                record_id = int(record["id"])
+                record_work_id = int(record["work_id"])
+                status = str(record["status"])
+                submitted_at = str(record["submitted_at"])
+                needs_reverification = status in reverify_statuses
+
+                # The checklist is stored as JSON in SQLite.
+                # New records store {check item: result}. Older records may
+                # contain a list, so keep a safe fallback for compatibility.
+                try:
+                    saved_checklist = json.loads(record["checklist"] or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    saved_checklist = {}
+
+                if isinstance(saved_checklist, dict):
+                    saved_results = saved_checklist
+                elif isinstance(saved_checklist, list):
+                    saved_results = {
+                        str(item): "Verified" for item in saved_checklist
+                    }
+                else:
+                    saved_results = {}
+
+                verified_total = sum(
+                    value == "Verified"
+                    for value in saved_results.values()
+                )
+                concern_total = sum(
+                    value == "Mismatch / Concern"
+                    for value in saved_results.values()
+                )
+                missing_total = sum(
+                    value == "Not Available / Missing"
+                    for value in saved_results.values()
+                )
+                unchecked_total = sum(
+                    value == "Not Checked"
+                    for value in saved_results.values()
+                )
+
+                if needs_reverification:
+                    status_class = "verification-status-red"
+                    status_icon = "⚠"
+                elif status == "Verified - No Issue Found":
+                    status_class = "verification-status-green"
+                    status_icon = "✓"
+                else:
+                    status_class = "verification-status-orange"
+                    status_icon = "•"
+
+                c1, c2, c3, c4, c5, c6 = st.columns(
+                    [0.6, 0.7, 1.8, 2.2, 1.7, 1.8]
+                )
+
+                c1.write(record_id)
+                c2.write(record_work_id)
+
+                c3.markdown(
+                    f'<span class="verification-history-status {status_class}">'
+                    f'{status_icon} {status}'
+                    f'</span>',
+                    unsafe_allow_html=True
+                )
+
+                c4.markdown(
+                    f'<div class="verification-summary-line">'
+                    f'✅ {verified_total} Verified &nbsp; '
+                    f'❌ {concern_total} Concern &nbsp; '
+                    f'⚠️ {missing_total} Missing'
+                    f'</div>',
+                    unsafe_allow_html=True
+                )
+
+                if unchecked_total > 0:
+                    c4.caption(f"⏳ {unchecked_total} not checked")
+
+                c5.write(submitted_at)
+
+                # Two actions: inspect the saved record or start a fresh
+                # verification cycle when the previous result needs review.
+                if c6.button(
+                    "View Details",
+                    key=f"view_verification_{record_id}",
+                    use_container_width=True
+                ):
+                    current_view = st.session_state.get(
+                        "verification_detail_record_id"
+                    )
+                    st.session_state["verification_detail_record_id"] = (
+                        None if current_view == record_id else record_id
+                    )
+                    st.rerun()
+
+                if needs_reverification:
+                    if c6.button(
+                        "↻ Re-verify",
+                        key=f"reverify_{record_id}",
+                        use_container_width=True,
+                        type="primary"
+                    ):
+                        st.session_state["verification_work_id"] = record_work_id
+                        st.session_state["verification_work_id_input"] = str(record_work_id)
+                        st.session_state["verification_cycle"] = verification_cycle + 1
+                        st.session_state["verification_detail_record_id"] = None
+                        st.rerun()
+                else:
+                    c6.caption("✓ No re-verification required")
+
+                # Expand only the history record selected with View Details.
+                if st.session_state.get("verification_detail_record_id") == record_id:
+
+                    st.markdown(f"### Verification Details — Record {record_id}")
+
+                    d1, d2, d3 = st.columns(3)
+                    d1.metric("Work ID", record_work_id)
+                    d2.metric("Verified", verified_total)
+                    d3.metric("Concerns / Missing", concern_total + missing_total)
+
+                    st.markdown(
+                        f'<span class="verification-history-status {status_class}">'
+                        f'{status_icon} {status}'
+                        f'</span>',
+                        unsafe_allow_html=True
+                    )
+
+                    st.caption(f"Submitted at: {submitted_at}")
+
+                    st.markdown("#### Saved Checklist Results")
+
+                    if saved_results:
+                        for item_number, (item, result) in enumerate(
+                            saved_results.items(),
+                            start=1
+                        ):
+                            if result == "Verified":
+                                result_icon = "✅"
+                            elif result == "Mismatch / Concern":
+                                result_icon = "❌"
+                            elif result == "Not Available / Missing":
+                                result_icon = "⚠️"
+                            else:
+                                result_icon = "⏳"
+
+                            st.markdown(
+                                f"**{item_number}. {item}** — {result_icon} **{result}**"
+                            )
+                            st.caption(
+                                f"Source: {get_verification_source(item)}"
+                            )
+                    else:
+                        st.info(
+                            "No structured checklist results are available for this older record."
+                        )
+
+                    remarks = str(record["remarks"] or "").strip()
+                    st.markdown("#### Officer Remarks")
+                    if remarks:
+                        st.info(remarks)
+                    else:
+                        st.caption("No officer remarks were saved for this record.")
+
+                    if st.button(
+                        "Close Details",
+                        key=f"close_verification_{record_id}"
+                    ):
+                        st.session_state["verification_detail_record_id"] = None
+                        st.rerun()
+
+                st.divider()
 
 
 # =========================================================
@@ -2953,19 +4612,55 @@ elif section == "Check New Work":
     st.title("Check New Work")
 
     st.caption(
-        "Enter work details to generate "
-        "an AI-assisted risk assessment."
+        "Enter work details to generate an explainable AI-assisted "
+        "risk assessment before official verification."
     )
-
 
     # -----------------------------------------------------
     # INPUT FORM
     # -----------------------------------------------------
 
+    st.markdown(
+        """
+        <div style="
+            margin: 18px 0 12px 0;
+            padding: 16px 18px;
+            border-radius: 16px;
+            background: linear-gradient(
+                135deg,
+                rgba(37,99,235,0.08),
+                rgba(99,102,241,0.06)
+            );
+            border: 1px solid rgba(37,99,235,0.12);
+        ">
+            <div style="
+                font-size: 0.78rem;
+                font-weight: 800;
+                letter-spacing: 0.08em;
+                text-transform: uppercase;
+                color: #2563eb;
+            ">
+                New Work Pre-Screening
+            </div>
+            <div style="
+                margin-top: 5px;
+                color: #475569;
+                font-size: 0.92rem;
+                line-height: 1.5;
+            ">
+                Compare the entered work with historical MPLADS patterns
+                using cost, delay and work-description indicators.
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
     with st.form("new_work_form"):
 
-        col1, col2 = st.columns(2)
+        st.markdown("### Work Information")
 
+        col1, col2 = st.columns(2)
 
         with col1:
 
@@ -2973,25 +4668,25 @@ elif section == "Check New Work":
                 "State",
                 sorted(
                     state_medians.index.tolist()
-                )
+                ),
+                help="Select the state used for historical cost and delay comparison."
             )
-
 
             category = st.selectbox(
                 "Work Category",
                 sorted(
                     category_medians.index.tolist()
-                )
+                ),
+                help="Select the category used to calculate the historical category median."
             )
-
 
             sanction_amount = st.number_input(
                 "Sanction Amount (₹)",
                 min_value=1.0,
                 value=300000.0,
-                step=1000.0
+                step=1000.0,
+                help="Enter the proposed or sanctioned amount for the work."
             )
-
 
         with col2:
 
@@ -2999,24 +4694,24 @@ elif section == "Check New Work":
                 "Sanction Delay (Days)",
                 min_value=0,
                 value=0,
-                step=1
+                step=1,
+                help="Enter the number of days between recommendation and sanction."
             )
-
 
             description = st.text_area(
                 "Work Description",
                 height=140,
                 placeholder=(
-                    "Enter the description of the proposed work..."
-                )
+                    "Example: Construction of a community hall "
+                    "with basic public facilities..."
+                ),
+                help="Provide a clear description of the proposed work."
             )
 
-
         analyze_button = st.form_submit_button(
-            "Analyze Work",
+            "🔍 Analyze Work",
             use_container_width=True
         )
-
 
     # -----------------------------------------------------
     # RUN ANALYSIS
@@ -3024,17 +4719,24 @@ elif section == "Check New Work":
 
     if analyze_button:
 
-        if not description.strip():
+        clean_description = description.strip()
+
+        if not clean_description:
 
             st.error(
-                "Please enter a work description."
+                "Please enter a work description before running the analysis."
             )
 
+        elif len(clean_description.split()) < 3:
+
+            st.error(
+                "Please provide a more descriptive work description "
+                "(at least 3 words)."
+            )
 
         else:
 
             new_work = {
-
                 "STATE_NAME":
                     state,
 
@@ -3048,14 +4750,12 @@ elif section == "Check New Work":
                     sanction_delay,
 
                 "WORK_DESCRIPTION":
-                    description
+                    clean_description
             }
-
 
             result = analyze_new_work(
                 new_work
             )
-
 
             if "error" in result:
 
@@ -3063,118 +4763,310 @@ elif section == "Check New Work":
                     result["error"]
                 )
 
-
             else:
 
-                st.success(
-                    "Work analysis completed successfully."
+                # Store the latest result so it remains visible after
+                # normal Streamlit reruns.
+                st.session_state["new_work_result"] = result
+                st.session_state["new_work_input"] = new_work
+
+    # -----------------------------------------------------
+    # DISPLAY LATEST ANALYSIS
+    # -----------------------------------------------------
+
+    if "new_work_result" in st.session_state:
+
+        result = st.session_state["new_work_result"]
+        analyzed_work = st.session_state["new_work_input"]
+
+        st.success(
+            "Work analysis completed successfully."
+        )
+
+        st.markdown("## AI Assessment")
+
+        # -------------------------------------------------
+        # TOP RESULT CARDS
+        # -------------------------------------------------
+
+        result_col1, result_col2, result_col3 = st.columns(3)
+
+        with result_col1:
+
+            st.metric(
+                "Risk Score",
+                result["risk_score"]
+            )
+
+        with result_col2:
+
+            st.metric(
+                "Risk Level",
+                result["risk_level"]
+            )
+
+        with result_col3:
+
+            st.metric(
+                "AI Status",
+                result["ai_status"]
+            )
+
+        # -------------------------------------------------
+        # RISK INTERPRETATION
+        # -------------------------------------------------
+
+        risk_level = result["risk_level"]
+
+        if risk_level == "High":
+            risk_icon = "🔴"
+            risk_message = (
+                "High relative review priority. Review the displayed "
+                "risk indicators and verify the work against official records."
+            )
+        elif risk_level == "Elevated":
+            risk_icon = "🟠"
+            risk_message = (
+                "Elevated relative review priority. Review the main "
+                "cost and delay indicators."
+            )
+        elif risk_level == "Moderate":
+            risk_icon = "🟡"
+            risk_message = (
+                "Moderate relative review priority based on the "
+                "historical comparison used by the prototype."
+            )
+        else:
+            risk_icon = "🟢"
+            risk_message = (
+                "Low relative review priority based on the historical "
+                "comparison used by the prototype."
+            )
+
+        st.markdown(
+            f"""
+            <div style="
+                margin: 12px 0 18px 0;
+                padding: 15px 17px;
+                border-radius: 15px;
+                background: rgba(255,255,255,0.88);
+                border: 1px solid rgba(148,163,184,0.20);
+                box-shadow: 0 8px 22px rgba(15,23,42,0.06);
+            ">
+                <div style="
+                    font-size: 0.78rem;
+                    font-weight: 800;
+                    letter-spacing: 0.06em;
+                    text-transform: uppercase;
+                    color: #64748b;
+                ">
+                    Review Priority
+                </div>
+                <div style="
+                    margin-top: 5px;
+                    font-size: 1.02rem;
+                    font-weight: 750;
+                    color: #0f172a;
+                ">
+                    {risk_icon} {risk_message}
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        # -------------------------------------------------
+        # WHY THIS RESULT
+        # -------------------------------------------------
+
+        st.markdown("### Why this result?")
+
+        if result["reasons"]:
+
+            for reason in result["reasons"]:
+                st.info(reason)
+
+        else:
+
+            st.info(
+                "No specific rule-based risk reason was identified. "
+                "The AI model may still identify an unusual combination "
+                "of analyzed patterns."
+            )
+
+        # -------------------------------------------------
+        # HISTORICAL COMPARISON
+        # -------------------------------------------------
+
+        st.markdown("### Historical Comparison")
+
+        category_median = float(
+            category_medians[
+                analyzed_work["WORK_CATEGORY"]
+            ]
+        )
+
+        state_median = float(
+            state_medians[
+                analyzed_work["STATE_NAME"]
+            ]
+        )
+
+        state_delay_median = float(
+            state_delay_medians[
+                analyzed_work["STATE_NAME"]
+            ]
+        )
+
+        comparison_col1, comparison_col2, comparison_col3 = st.columns(3)
+
+        with comparison_col1:
+
+            st.metric(
+                "Entered Amount",
+                f"₹{analyzed_work['SANCTION_AMOUNT']:,.0f}"
+            )
+
+            st.metric(
+                "Category Median",
+                f"₹{category_median:,.0f}"
+            )
+
+        with comparison_col2:
+
+            st.metric(
+                "State Median Amount",
+                f"₹{state_median:,.0f}"
+            )
+
+            st.metric(
+                "Cost vs Category",
+                f"{result['cost_deviation']:.2f}×"
+            )
+
+        with comparison_col3:
+
+            st.metric(
+                "Entered Delay",
+                f"{result['sanction_delay_days']} days"
+            )
+
+            st.metric(
+                "State Median Delay",
+                f"{state_delay_median:.0f} days"
+            )
+
+        # -------------------------------------------------
+        # ANALYZED INDICATORS
+        # -------------------------------------------------
+
+        st.markdown("### Analyzed Indicators")
+
+        indicator_col1, indicator_col2 = st.columns(2)
+
+        with indicator_col1:
+
+            st.metric(
+                "Category Cost Deviation",
+                f"{result['cost_deviation']:.2f}×"
+            )
+
+            st.metric(
+                "State Cost Deviation",
+                f"{result['state_cost_deviation']:.2f}×"
+            )
+
+        with indicator_col2:
+
+            st.metric(
+                "Sanction Delay",
+                f"{result['sanction_delay_days']} days"
+            )
+
+            st.metric(
+                "State Delay Deviation",
+                f"{result['state_delay_deviation']:.2f}×"
+            )
+
+        # -------------------------------------------------
+        # WORK INPUT SUMMARY
+        # -------------------------------------------------
+
+        with st.expander("View Entered Work Details"):
+
+            summary_col1, summary_col2 = st.columns(2)
+
+            with summary_col1:
+
+                st.write(
+                    f"**State:** {analyzed_work['STATE_NAME']}"
                 )
 
-
-                # -----------------------------------------
-                # RESULT
-                # -----------------------------------------
-
-                st.markdown(
-                    "## Analysis Result"
+                st.write(
+                    f"**Work Category:** {analyzed_work['WORK_CATEGORY']}"
                 )
 
-
-                result_col1, result_col2, result_col3 = (
-                    st.columns(3)
+                st.write(
+                    f"**Sanction Amount:** "
+                    f"₹{analyzed_work['SANCTION_AMOUNT']:,.0f}"
                 )
 
+            with summary_col2:
 
-                with result_col1:
-
-                    st.metric(
-                        "Risk Score",
-                        result["risk_score"]
-                    )
-
-
-                with result_col2:
-
-                    st.metric(
-                        "Risk Level",
-                        result["risk_level"]
-                    )
-
-
-                with result_col3:
-
-                    st.metric(
-                        "AI Status",
-                        result["ai_status"]
-                    )
-
-
-                # -----------------------------------------
-                # REASONS
-                # -----------------------------------------
-
-                st.markdown(
-                    "### Assessment Reasons"
+                st.write(
+                    f"**Sanction Delay:** "
+                    f"{analyzed_work['SANCTION_DELAY_DAYS']} days"
                 )
 
-
-                if result["reasons"]:
-
-                    for reason in result["reasons"]:
-
-                        st.warning(
-                            reason
-                        )
-
-                else:
-
-                    st.info(
-                        "No specific risk reason was identified."
-                    )
-
-
-                # -----------------------------------------
-                # ANALYSIS DETAILS
-                # -----------------------------------------
-
-                st.markdown(
-                    "### Analysis Details"
+                st.write(
+                    f"**Description:** "
+                    f"{analyzed_work['WORK_DESCRIPTION']}"
                 )
 
+        # -------------------------------------------------
+        # IMPORTANT AI NOTE
+        # -------------------------------------------------
 
-                detail_col1, detail_col2 = (
-                    st.columns(2)
+        st.warning(
+            "AI screening only: this assessment identifies unusual "
+            "patterns relative to the historical dataset. It does not "
+            "confirm fraud and does not replace official verification."
+        )
+
+        # -------------------------------------------------
+        # ACTION
+        # -------------------------------------------------
+
+        action_col1, action_col2 = st.columns(2)
+
+        with action_col1:
+
+            if st.button(
+                "🔄 Check Another Work",
+                use_container_width=True,
+                key="reset_new_work"
+            ):
+
+                st.session_state.pop(
+                    "new_work_result",
+                    None
                 )
 
+                st.session_state.pop(
+                    "new_work_input",
+                    None
+                )
 
-                with detail_col1:
+                st.rerun()
 
-                    st.metric(
-                        "Category Cost Deviation",
-                        f"{result['cost_deviation']}×"
-                    )
+        with action_col2:
 
-
-                    st.metric(
-                        "State Cost Deviation",
-                        f"{result['state_cost_deviation']}×"
-                    )
-
-
-                with detail_col2:
-
-                    st.metric(
-                        "Sanction Delay",
-                        f"{result['sanction_delay_days']} days"
-                    )
-
-
-                    st.metric(
-                        "State Delay Deviation",
-                        f"{result['state_delay_deviation']}×"
-                    )
+            st.caption(
+                "Use the Verification workflow for official record checking."
+            )
 
 # =========================================================
+
 # FLOATING MPLAD-AI ASSISTANT
 # =========================================================
 
