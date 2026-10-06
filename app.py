@@ -11,6 +11,16 @@ import secrets
 import smtplib
 from email.message import EmailMessage
 from datetime import datetime, timedelta
+from supabase import create_client
+
+# =========================================================
+# SUPABASE CONNECTION
+# =========================================================
+
+supabase = create_client(
+    st.secrets["SUPABASE_URL"],
+    st.secrets["SUPABASE_SECRET_KEY"]
+)
 
 
 # =========================================================
