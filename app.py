@@ -100,7 +100,8 @@ def initialize_verification_db():
             created_at TEXT NOT NULL,
             approval_status TEXT NOT NULL DEFAULT 'Pending',
             approved_at TEXT,
-            approved_by TEXT
+            approved_by TEXT,
+            access_status TEXT NOT NULL DEFAULT 'Active'
         )
         """
     )
@@ -117,6 +118,10 @@ def initialize_verification_db():
         connection.execute("ALTER TABLE officer_users ADD COLUMN approved_at TEXT")
     if "approved_by" not in existing_columns:
         connection.execute("ALTER TABLE officer_users ADD COLUMN approved_by TEXT")
+    if "access_status" not in existing_columns:
+        connection.execute(
+            "ALTER TABLE officer_users ADD COLUMN access_status TEXT NOT NULL DEFAULT 'Active'"
+        )
 
     connection.commit()
     connection.close()
@@ -156,7 +161,8 @@ def authenticate_officer(login_value, password):
 
     officer = connection.execute(
         """
-        SELECT id, officer_name, email, phone, password_hash, salt, approval_status
+        SELECT id, officer_name, email, phone, password_hash, salt,
+               approval_status, access_status
         FROM officer_users
         WHERE lower(email) = ? OR phone = ?
         """,
@@ -178,7 +184,21 @@ def authenticate_officer(login_value, password):
             "email": officer[2],
             "phone": officer[3],
             "approval_status": officer[6],
+            "access_status": officer[7],
             "not_approved": True,
+            "access_disabled": False,
+        }
+
+    if officer[7] != "Active":
+        return {
+            "id": officer[0],
+            "name": officer[1],
+            "email": officer[2],
+            "phone": officer[3],
+            "approval_status": officer[6],
+            "access_status": officer[7],
+            "not_approved": False,
+            "access_disabled": True,
         }
 
     return {
@@ -187,7 +207,9 @@ def authenticate_officer(login_value, password):
         "email": officer[2],
         "phone": officer[3],
         "approval_status": officer[6],
+        "access_status": officer[7],
         "not_approved": False,
+        "access_disabled": False,
     }
 
 
@@ -314,8 +336,8 @@ def create_officer_account(officer_name, email, phone, password):
         connection.execute(
             """
             INSERT INTO officer_users
-            (officer_name, email, phone, password_hash, salt, created_at, approval_status)
-            VALUES (?, ?, ?, ?, ?, ?, 'Pending')
+            (officer_name, email, phone, password_hash, salt, created_at, approval_status, access_status)
+            VALUES (?, ?, ?, ?, ?, ?, 'Pending', 'Active')
             """,
             (
                 officer_name.strip(),
@@ -379,7 +401,7 @@ def get_all_officers():
     rows = connection.execute(
         """
         SELECT id, officer_name, email, phone, created_at,
-               approval_status, approved_at, approved_by
+               approval_status, approved_at, approved_by, access_status
         FROM officer_users
         ORDER BY id DESC
         """
@@ -399,6 +421,26 @@ def update_officer_approval(officer_id, status, admin_email):
         WHERE id = ?
         """,
         (status, decision_time, admin_email, int(officer_id)),
+    )
+
+    connection.commit()
+    connection.close()
+
+
+def update_officer_access(officer_id, access_status):
+    """Enable or disable an approved officer's application access."""
+    if access_status not in ("Active", "Suspended"):
+        return
+
+    connection = get_db_connection()
+
+    connection.execute(
+        """
+        UPDATE officer_users
+        SET access_status = ?
+        WHERE id = ?
+        """,
+        (access_status, int(officer_id)),
     )
 
     connection.commit()
@@ -1985,6 +2027,11 @@ def show_login_page():
 
                 if officer is None:
                     st.error("Invalid email/phone number or password.")
+                elif officer.get("access_disabled"):
+                    st.error(
+                        "Your account access has been disabled by the administrator. "
+                        "Please contact the administrator."
+                    )
                 elif officer.get("not_approved"):
                     if officer.get("approval_status") == "Pending":
                         st.warning(
@@ -2234,16 +2281,82 @@ def show_admin_page():
                     all_officers,
                     columns=[
                         "ID", "Officer Name", "Email", "Phone", "Registered",
-                        "Status", "Decision Time", "Approved By"
+                        "Status", "Decision Time", "Approved By", "Access"
                     ],
                 )
                 st.dataframe(
                     df[
-                        ["ID", "Officer Name", "Email", "Phone", "Registered", "Status"]
+                        [
+                            "ID", "Officer Name", "Email", "Phone",
+                            "Registered", "Status", "Access"
+                        ]
                     ],
                     use_container_width=True,
                     hide_index=True,
                 )
+
+                st.markdown("### Manage Officer Access")
+                st.caption(
+                    "Remove Access blocks an approved officer from signing in. "
+                    "Restore Access enables the account again without requiring re-registration."
+                )
+
+                for row in all_officers:
+                    (
+                        officer_id,
+                        officer_name,
+                        officer_email,
+                        officer_phone,
+                        registered_at,
+                        approval_status,
+                        decision_time,
+                        approved_by,
+                        access_status,
+                    ) = row
+
+                    if approval_status == "Approved":
+                        with st.container(border=True):
+                            access_col1, access_col2, access_col3 = st.columns(
+                                [3.4, 1.2, 1.2]
+                            )
+
+                            with access_col1:
+                                if access_status == "Active":
+                                    st.markdown(
+                                        f"**{officer_name}**  •  {officer_email}"
+                                    )
+                                    st.caption("🟢 Access Active")
+                                else:
+                                    st.markdown(
+                                        f"**{officer_name}**  •  {officer_email}"
+                                    )
+                                    st.caption("🔴 Access Suspended")
+
+                            with access_col2:
+                                if access_status == "Active":
+                                    if st.button(
+                                        "Remove Access",
+                                        key=f"remove_access_{officer_id}",
+                                        use_container_width=True,
+                                    ):
+                                        update_officer_access(
+                                            officer_id,
+                                            "Suspended",
+                                        )
+                                        st.rerun()
+
+                            with access_col3:
+                                if access_status == "Suspended":
+                                    if st.button(
+                                        "Restore Access",
+                                        key=f"restore_access_{officer_id}",
+                                        use_container_width=True,
+                                    ):
+                                        update_officer_access(
+                                            officer_id,
+                                            "Active",
+                                        )
+                                        st.rerun()
 
             if st.button(
                 "Logout Administrator",
